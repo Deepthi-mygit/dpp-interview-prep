@@ -406,6 +406,108 @@ envs/dev/    @pharma-developers
 
 ---
 
+## A4
+
+### Question
+> "What are ArgoCD sync waves and sync hooks? Give a concrete example of when you would use them."
+
+### What the interviewer is really testing
+- Do you know ArgoCD beyond basic sync?
+- Can you solve ordering problems in a GitOps deployment?
+- Do you understand the difference between waves and hooks?
+
+---
+
+### Model Answer
+
+ArgoCD provides two mechanisms for controlling the ORDER of resource deployment within a sync: **sync waves** and **sync hooks**.
+
+---
+
+### Sync Waves
+
+A sync wave is an integer annotation on a Kubernetes resource that determines when in the sync cycle it is applied. Lower numbers apply first. Resources without an annotation default to wave 0.
+
+```yaml
+# Apply this Job in wave -1 — before all other resources
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrate
+          image: 516209541629.dkr.ecr.us-east-1.amazonaws.com/drug-catalog-service:sha-abc123
+          command: ["java", "-jar", "app.jar", "--migrate-only"]
+```
+
+```yaml
+# The main Deployment applies in wave 0 (default)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drug-catalog-service
+  # no wave annotation = wave 0
+```
+
+In this example, ArgoCD ensures the migration Job completes successfully (exits 0) before creating the Deployment. If the migration fails, the sync stops — the new application pods never start. This solves the database migration ordering problem without needing Helm hooks or init containers.
+
+---
+
+### Sync Hooks
+
+A sync hook is a resource (typically a Job or Pod) that runs at a specific phase of the sync lifecycle:
+
+| Hook | When it runs |
+|------|-------------|
+| `PreSync` | Before any resources are applied |
+| `Sync` | During the sync (same as wave 0) |
+| `PostSync` | After all resources are healthy |
+| `SyncFail` | If the sync fails (cleanup/notification) |
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: smoke-test
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  template:
+    spec:
+      containers:
+        - name: smoke
+          image: curlimages/curl
+          command: ["curl", "-f", "http://drug-catalog-service:8083/actuator/health"]
+```
+
+`HookSucceeded` means ArgoCD deletes the Job after it passes — so it doesn't clutter the namespace. `HookFailed` would delete it on failure. `BeforeHookCreation` (default) deletes a previous run of the hook before creating a new one.
+
+---
+
+### Waves vs Hooks — when to use which
+
+| Use case | Solution |
+|----------|----------|
+| Database migration before app starts | PreSync hook or wave -1 |
+| Ordering between multiple services in one sync | Sync waves |
+| Smoke test after everything is healthy | PostSync hook |
+| Notification on deploy failure | SyncFail hook |
+| Clean up temporary resources after sync | HookSucceeded delete policy |
+
+---
+
+### Project context
+
+In zen-gitops, the most common use case is database migration ordering. Our Flyway migrations run as a Kubernetes Job annotated with `sync-wave: "-1"` in the dev and QA environments — ArgoCD guarantees the migration completes before rolling out the new application pods. In production, we use a PreSync hook instead so the migration is isolated from the Deployment rollout entirely.
+
+---
+
 ## A5
 
 ### Question
