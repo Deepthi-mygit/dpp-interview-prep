@@ -212,6 +212,32 @@ Postmortem within 24h. Three action items:
 
 ---
 
+## G3
+
+### Question
+> "Tell me about a time you had to push back on a request from a product manager or senior stakeholder. How did you handle it?"
+
+### What the interviewer is really testing
+- Can you hold your ground technically without being difficult to work with?
+- Do you understand the difference between "no" and "not yet, here's why"?
+- Can you communicate risk to non-technical stakeholders?
+
+---
+
+### Model Answer
+
+A product manager once asked us to skip the QA environment and deploy directly to PROD to meet a deadline — a critical demo for a pharma client the next morning. The feature was working in DEV, tests were passing, and the PM argued that QA was just a formality.
+
+My response was not a flat refusal. I explained specifically what QA gives us that DEV does not: our QA database has anonymised production-scale data (millions of drug catalog records), while DEV has synthetic data with about 200 rows. A performance issue that's invisible in DEV will surface in QA under realistic load. I also pointed out that skipping QA would mean our PROD rollback procedure hadn't been validated for this specific change — if something went wrong mid-demo we'd be debugging live in front of the client.
+
+I proposed an alternative: run a targeted smoke test against QA within the next two hours, focusing only on the new feature's code path. If it passed, we'd promote to PROD that evening with a 30-minute buffer before the demo. If it failed, we'd know before the client arrived instead of during.
+
+The PM agreed. The smoke test found a slow query that was fine in DEV but timed out against real data. We added an index, re-ran, and deployed successfully. The demo went without issues.
+
+The key: I didn't say "no, we follow the process." I said "here is the specific risk and here is a way to manage it that still meets your deadline." That's the conversation that builds trust with stakeholders instead of friction.
+
+---
+
 ## G4
 
 ### Question
