@@ -433,6 +433,262 @@ Pod Pending for >2 min
 ---
 
 
+## H3
+
+### Question
+> "The drug-catalog-service pod is in `ImagePullBackOff`. You can see the image in ECR. Walk me through every reason this can happen and how you fix each one."
+
+### What the interviewer is really testing
+- ECR authentication mechanics on EKS
+- IRSA understanding for ECR pull
+- Systematic elimination of causes
+
+---
+
+### Model Answer
+
+**ImagePullBackOff means:** the kubelet tried to pull the image and failed. Kubernetes backs off exponentially before retrying.
+
+---
+
+### Step 1: Get the exact error
+
+```bash
+kubectl describe pod drug-catalog-service-<hash> -n prod
+# Events section:
+# Failed to pull image "516209541629.dkr.ecr.us-east-1.amazonaws.com/drug-catalog-service:sha-abc123"
+# Error: rpc error: code = Unknown desc = failed to pull and unpack image:
+#   failed to resolve reference "...":
+#   unexpected status code 401 Unauthorized
+
+# Or:
+# Error: rpc error: code = Unknown desc = failed to pull and unpack image:
+#   failed to resolve reference "...":
+#   repository "drug-catalog-service" not found
+```
+
+---
+
+### Possible causes and fixes
+
+**Cause 1: ECR authorization token expired (most common)**
+
+ECR tokens are valid for 12 hours. EKS nodes use the `ec2:ecr-token-manager` via the node IAM role to refresh them automatically — but the role must have the right permissions.
+
+```bash
+# Check the node IAM role has ECR pull permissions
+aws iam get-role-policy \
+  --role-name pharma-prod-cluster-node-group-role \
+  --policy-name AmazonEC2ContainerRegistryReadOnly
+
+# Or check the attached managed policies
+aws iam list-attached-role-policies \
+  --role-name pharma-prod-cluster-node-group-role
+# Expected: AmazonEC2ContainerRegistryReadOnly is attached
+```
+
+**Fix:** Attach `AmazonEC2ContainerRegistryReadOnly` to the node group IAM role in Terraform and apply.
+
+---
+
+**Cause 2: Image tag or SHA doesn't exist in ECR**
+
+The values file references a tag that was never pushed or was overwritten.
+
+```bash
+# List all tags for the repository
+aws ecr list-images \
+  --repository-name drug-catalog-service \
+  --region us-east-1 \
+  --query 'imageIds[*].imageTag' \
+  --output table
+
+# Check what tag ArgoCD is trying to pull
+kubectl get deployment drug-catalog-service -n prod \
+  -o jsonpath='{.spec.template.spec.containers[0].image}'
+```
+
+**Fix:** Check the zen-gitops values file. If the tag is missing from ECR, re-run the CI pipeline for that commit.
+
+---
+
+**Cause 3: Cross-account image (wrong account ID in ECR URI)**
+
+```bash
+# The image URI in the pod spec
+kubectl get pod drug-catalog-service-<hash> -n prod \
+  -o jsonpath='{.spec.containers[0].image}'
+# 516209541629.dkr.ecr.us-east-1.amazonaws.com/drug-catalog-service:sha-abc123
+# ^^^^^^^^^^^^ This must be YOUR account ID
+```
+
+**Fix:** Correct the account ID in the Helm values file and redeploy.
+
+---
+
+**Cause 4: Wrong region**
+
+```bash
+# ECR region must match where the image was pushed
+# us-east-1 in URI vs node in us-west-2 → will fail
+kubectl get pod drug-catalog-service-<hash> -n prod \
+  -o jsonpath='{.spec.containers[0].image}' | grep -o 'ecr\.[^.]*'
+# ecr.us-east-1 ← confirm this matches your cluster region
+```
+
+---
+
+**Cause 5: Network policy blocking egress to ECR**
+
+```bash
+# Check NetworkPolicy in prod namespace
+kubectl get networkpolicy -n prod
+
+# If egress is restricted, nodes may not reach ECR endpoint
+# ECR uses regional endpoints: api.ecr.us-east-1.amazonaws.com
+# For private ECR: VPC endpoints for ECR (ecr.api, ecr.dkr, s3) must exist
+```
+
+---
+
+### Quick diagnosis flowchart
+
+```
+ImagePullBackOff
+       │
+       └── kubectl describe pod → Events → exact error message
+               │
+               ├── 401 Unauthorized → node IAM role missing ECR policy
+               ├── repository not found → wrong account ID or region
+               ├── manifest unknown → tag doesn't exist in ECR
+               ├── timeout / no route → network policy or VPC endpoint missing
+               └── name resolution failed → DNS issue or private endpoint misconfigured
+```
+
+---
+
+
+## H4
+
+### Question
+> "ArgoCD shows the auth-service application as `OutOfSync` even though no one changed the Helm values. What causes this and how do you handle it without blindly syncing?"
+
+### What the interviewer is really testing
+- Understanding of ArgoCD's sync algorithm and what it compares
+- Drift awareness — not everything in `OutOfSync` is a problem
+- Judgment: investigate before sync, not sync first
+
+---
+
+### Model Answer
+
+**OutOfSync means:** ArgoCD computed the desired manifests from the Git repo and compared them to the live cluster state, and found a difference. This does NOT always mean something is wrong.
+
+---
+
+### Common causes of unexpected OutOfSync
+
+**Cause 1: Resource mutation by admission controllers (most common)**
+
+Kyverno or other admission webhooks can mutate resources on create/update, adding annotations, labels, or fields that are not in the Helm values. ArgoCD sees the cluster object as different from what Helm would render.
+
+```bash
+# Check what ArgoCD sees as the diff
+argocd app diff auth-service-prod
+
+# Example output:
+# + metadata.annotations:
+# +   kyverno.io/last-applied-configuration: ...
+# +   kubectl.kubernetes.io/last-applied-configuration: ...
+```
+
+**Fix:** Add an ArgoCD `ignoreDifferences` rule for this annotation in the Application spec.
+
+```yaml
+spec:
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /metadata/annotations/kyverno.io~1last-applied-configuration
+```
+
+---
+
+**Cause 2: Horizontal Pod Autoscaler changed replica count**
+
+If an HPA is active, it modifies `spec.replicas` on the Deployment. ArgoCD then sees the replica count in the cluster differs from the Helm values.
+
+```bash
+kubectl get hpa -n prod
+# NAME           REFERENCE                        REPLICAS
+# auth-service   Deployment/auth-service          3        ← HPA scaled to 3
+# Helm values say: replicaCount: 1 → OutOfSync
+
+argocd app diff auth-service-prod | grep replicas
+```
+
+**Fix:** Either ignore `spec.replicas` in ArgoCD, or remove `replicaCount` from the Helm values when HPA is enabled.
+
+```yaml
+spec:
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /spec/replicas
+```
+
+---
+
+**Cause 3: Someone ran `kubectl apply` or `kubectl edit` directly**
+
+This is drift — the cluster state was changed outside GitOps. This is the case where you SHOULD sync (after reviewing the diff).
+
+```bash
+# See what changed and who changed it
+kubectl describe deployment auth-service -n prod | grep -A5 "Annotations:"
+# kubectl.kubernetes.io/last-applied-configuration shows the last kubectl apply
+
+# Check ArgoCD audit log for when OutOfSync appeared
+argocd app history auth-service-prod
+```
+
+**Fix:** Review the diff (`argocd app diff`), determine if the manual change is intentional (if so, add it to git), then sync ArgoCD.
+
+---
+
+**Cause 4: Helm rendering is non-deterministic**
+
+Some Helm charts use `randAlphaNum` or `now` in templates — these generate different values on each render. ArgoCD re-renders on every sync cycle and sees a difference every time.
+
+```bash
+argocd app diff auth-service-prod | grep -i rand
+```
+
+**Fix:** Replace dynamic values in Helm templates with static values or use a Kubernetes Secret with a stable value set at install time.
+
+---
+
+### Decision flow before syncing
+
+```
+ArgoCD shows OutOfSync
+       │
+       └── argocd app diff auth-service-prod
+               │
+               ├── Only annotations/metadata → likely admission controller → add ignoreDifferences
+               ├── Replica count only → HPA active → add ignoreDifferences for /spec/replicas
+               ├── Actual config change → check git log, someone may have manually changed cluster
+               │         → review diff, if OK, add to git, then sync
+               └── Random-looking value → non-deterministic Helm template → fix template
+```
+
+**Never blindly sync OutOfSync.** Always run `argocd app diff` first to understand what changed.
+
+---
+
+
 ## H5
 
 ### Question
@@ -529,6 +785,145 @@ kubectl get configmap auth-service -n prod -o yaml
 # DB_HOST: pharma-prod-postgres.cs3c424yurej.us-east-1.rds.amazonaws.com (correct)
 # SERVER_PORT: "8081" (matches readiness probe port)
 # SPRING_PROFILES_ACTIVE: prod
+```
+
+---
+
+
+## H6
+
+### Question
+> "A Kubernetes NetworkPolicy was applied to the prod namespace and now inter-service calls are failing. The drug-catalog-service can no longer reach the auth-service. How do you diagnose and fix it without removing the NetworkPolicy entirely?"
+
+### What the interviewer is really testing
+- Understanding of NetworkPolicy mechanics (default-deny model)
+- How to test connectivity inside the cluster
+- Writing targeted allow rules rather than giving up and disabling security
+
+---
+
+### Model Answer
+
+**NetworkPolicy mechanics:** By default, pods accept all traffic. Once ANY NetworkPolicy selects a pod via `podSelector`, all traffic not explicitly allowed by a policy is denied. This is the "default deny" effect.
+
+---
+
+### Step 1: Identify which NetworkPolicy is selecting the affected pods
+
+```bash
+# List all NetworkPolicies in prod
+kubectl get networkpolicy -n prod
+
+# Describe to see pod selectors and rules
+kubectl describe networkpolicy -n prod
+# Look for:
+# PodSelector: app.kubernetes.io/name=auth-service
+# Ingress:     <allowed sources>
+# Egress:      <allowed destinations>
+```
+
+---
+
+### Step 2: Test connectivity directly
+
+```bash
+# Exec into the drug-catalog-service and try to reach auth-service
+kubectl exec -n prod deployment/drug-catalog-service -- \
+  curl -v http://auth-service:8081/actuator/health --max-time 5
+
+# Expected if blocked:
+# * connect to 10.100.x.x port 8081 failed: Connection timed out
+# (timeout, not refused — NetworkPolicy drops packets silently)
+```
+
+---
+
+### Step 3: Understand the problem — what is missing
+
+NetworkPolicy operates on label selectors. The drug-catalog-service must be listed as an allowed ingress source for the auth-service policy.
+
+```bash
+# Get labels on drug-catalog-service pods
+kubectl get pods -n prod -l app.kubernetes.io/name=drug-catalog-service --show-labels
+
+# Get the auth-service NetworkPolicy ingress rules
+kubectl get networkpolicy auth-service-policy -n prod -o yaml
+# Look for ingress.from.podSelector
+# If drug-catalog-service is not in the from list → traffic is blocked
+```
+
+---
+
+### Step 4: Fix — add a targeted ingress rule (do NOT remove the policy)
+
+Add a rule that allows traffic from drug-catalog-service pods to auth-service on port 8081:
+
+```yaml
+# Patch the existing NetworkPolicy or update via Helm values:
+# In helm-charts/templates/networkpolicy.yaml:
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth-service-policy
+  namespace: prod
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: auth-service
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: drug-catalog-service   # ← add this
+    ports:
+    - protocol: TCP
+      port: 8081
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx          # NGINX ingress
+    ports:
+    - protocol: TCP
+      port: 8081
+```
+
+---
+
+### Step 5: Verify after fix
+
+```bash
+# Re-test connectivity
+kubectl exec -n prod deployment/drug-catalog-service -- \
+  curl -s http://auth-service:8081/actuator/health
+
+# Expected:
+# {"status":"UP"}
+```
+
+---
+
+### Common NetworkPolicy mistakes
+
+| Mistake | Effect |
+|---------|--------|
+| No `namespaceSelector` when calling cross-namespace | Block all cross-namespace traffic even with correct podSelector |
+| Policy only has `Ingress` type but pod needs egress to DB | Egress to DB still works (egress not selected), ingress blocked |
+| Policy added after readiness probe configured | Kubelet's readiness probe (from node, not pod) gets blocked → pod stuck not-ready |
+| Wrong label in `podSelector` | All traffic blocked: policy selects no pods, so nothing is allowed |
+
+---
+
+### Key rule: ingress to auth-service must also allow kube-system
+
+```bash
+# The kubelet and kube-system components need to reach pods for health probes
+# If you forget namespaceSelector for kube-system:
+kubectl get networkpolicy auth-service-policy -n prod -o yaml | \
+  grep -A10 "from:"
+# Ensure kube-system namespace is allowed for probe traffic
 ```
 
 ---
@@ -663,6 +1058,129 @@ Common Spring Boot memory leak causes:
 | **Short-term** | Enable GC logging to see if GC is running frequently before OOM |
 | **Permanent** | Find and fix the leak: heap dump analysis, add `spring.cache.caffeine.spec=maximumSize=1000,expireAfterWrite=10m` |
 | **Permanent** | Add Prometheus alert: memory usage > 80% of limit for 5 minutes → page before OOM |
+
+---
+
+
+## H8
+
+### Question
+> "A rolling update of the manufacturing-service is stuck. Old pods are terminating but new pods stay in `ContainerCreating` for 15 minutes. The deployment shows 0 available replicas. What do you do?"
+
+### What the interviewer is really testing
+- Rolling update mechanics — maxUnavailable, maxSurge
+- Distinguishing scheduling failure from image pull from volume mount failure
+- Safe intervention: pause, investigate, resume or roll back
+
+---
+
+### Model Answer
+
+**ContainerCreating means:** the pod is scheduled to a node but the container has not started. The kubelet is preparing the container — pulling image, mounting volumes, setting up networking.
+
+If it's stuck here for more than 5 minutes, something is blocking container startup.
+
+---
+
+### Step 1: Pause the rollout immediately
+
+```bash
+# Before you investigate, stop the rollout from creating more stuck pods
+kubectl rollout pause deployment/manufacturing-service -n prod
+
+# Check the current rollout status
+kubectl rollout status deployment/manufacturing-service -n prod
+# "Waiting for rollout to finish: 1 out of 3 new replicas have been updated..."
+```
+
+---
+
+### Step 2: Describe a stuck new pod
+
+```bash
+# Find new pods (ContainerCreating)
+kubectl get pods -n prod -l app.kubernetes.io/name=manufacturing-service
+
+# Describe the stuck one
+kubectl describe pod manufacturing-service-<new-hash> -n prod
+# Focus on Events:
+# - "pulling image..." → still pulling (check if this is a large image on slow network)
+# - "failed to pull image" → ImagePullBackOff (see H3)
+# - "MountVolume.SetUp failed" → volume mount issue
+# - "RunContainerError" → container started but failed immediately (different from ContainerCreating)
+# - No events at all → kubelet hasn't processed it yet
+```
+
+---
+
+### Step 3: Investigate by event type
+
+**If stuck on image pull:**
+```bash
+# How large is the new image?
+aws ecr describe-images \
+  --repository-name manufacturing-service \
+  --region us-east-1 \
+  --query 'imageDetails[?contains(imageTags,`sha-newver`)].[imageSizeInBytes]'
+# If >1GB on a t3.small node → pulls can take 10-15 min on first pull
+
+# Is the image already cached on the node?
+# (no direct command, but if all pods land on same node they share the cache)
+```
+
+**If stuck on volume mount (InitContainer or ConfigMap/Secret):**
+```bash
+# Check if ConfigMap/Secret referenced in new version exists
+kubectl get configmap manufacturing-service -n prod
+kubectl get secret db-credentials -n prod
+
+# Check if ExternalSecret has synced the new secret version
+kubectl get externalsecret -n prod
+kubectl describe externalsecret db-credentials -n prod | grep -A5 "Conditions:"
+```
+
+**If stuck due to init container:**
+```bash
+# Init containers must complete before the main container starts
+kubectl get pod manufacturing-service-<new-hash> -n prod -o jsonpath='{.status.initContainerStatuses}'
+# Look for: "state": {"waiting": {"reason": "CrashLoopBackOff"}}
+kubectl logs manufacturing-service-<new-hash> -n prod -c init-<name>
+```
+
+---
+
+### Step 4: Decision — resume or roll back
+
+```bash
+# If you identified and fixed the issue (e.g., pushed the missing secret):
+kubectl rollout resume deployment/manufacturing-service -n prod
+
+# If the new image is fundamentally broken and fixing takes time:
+kubectl rollout undo deployment/manufacturing-service -n prod
+# This rolls back to the previous ReplicaSet revision
+
+# Verify rollback completed
+kubectl rollout status deployment/manufacturing-service -n prod
+# "deployment "manufacturing-service" successfully rolled out"
+
+kubectl get pods -n prod -l app.kubernetes.io/name=manufacturing-service
+# All pods should be Running and 1/1 READY again
+```
+
+---
+
+### maxUnavailable and maxSurge context
+
+From this repo's Helm chart default strategy:
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0    # Never reduce below desired replicas
+    maxSurge: 1          # Can create 1 extra pod during rollout
+```
+
+With `maxUnavailable: 0`, a stuck new pod blocks the entire rollout — no old pods are terminated until new ones are ready. This is the safe default for production but means a broken new image can leave the deployment stuck indefinitely.
 
 ---
 
@@ -1062,6 +1580,83 @@ touch /tmp/test && echo "tmp is writable" || echo "tmp is read-only"
 # 6. From Java process perspective (if JDK tools available)
 jcmd 1 VM.system_properties | grep -i "db\|datasource"
 ```
+
+---
+
+
+## I5
+
+### Question
+> "How do you check what resources a namespace is consuming right now — CPU, memory, pods — and compare that to its limits? Give exact commands."
+
+---
+
+### Commands
+
+```bash
+# 1. Live resource usage by pod in the namespace (requires metrics-server)
+kubectl top pods -n prod
+# NAME                               CPU(cores)   MEMORY(bytes)
+# auth-service-7d9f8c-xk2pv         12m          221Mi
+# drug-catalog-service-9b3f4d-lm8k   8m           198Mi
+# manufacturing-service-2c6a1e-pq5r  45m          389Mi
+
+# 2. Live resource usage summed by node (for capacity planning)
+kubectl top nodes
+# NAME                   CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+# ip-10-0-1-45.ec2       312m         15%    1842Mi          73%
+
+# 3. Resource requests and limits defined in pod specs (what is reserved)
+kubectl get pods -n prod \
+  -o custom-columns="NAME:.metadata.name,CPU_REQ:.spec.containers[*].resources.requests.cpu,MEM_REQ:.spec.containers[*].resources.requests.memory,CPU_LIM:.spec.containers[*].resources.limits.cpu,MEM_LIM:.spec.containers[*].resources.limits.memory"
+# NAME                               CPU_REQ   MEM_REQ   CPU_LIM   MEM_LIM
+# auth-service-7d9f8c-xk2pv         100m      256Mi     500m      512Mi
+# drug-catalog-service-9b3f4d-lm8k   100m      256Mi     500m      512Mi
+
+# 4. Check if a ResourceQuota exists and how much is used
+kubectl get resourcequota -n prod
+kubectl describe resourcequota -n prod
+# Name:       prod-quota
+# Namespace:  prod
+# Resource              Used   Hard
+# --------              ----   ----
+# pods                  6      20
+# requests.cpu          600m   4
+# requests.memory       1536Mi 8Gi
+# limits.cpu            3      8
+# limits.memory         3072Mi 16Gi
+
+# 5. Check LimitRange (default requests/limits for pods without explicit values)
+kubectl get limitrange -n prod
+kubectl describe limitrange -n prod
+# Useful if pods are created without requests — LimitRange sets defaults
+
+# 6. Nodes: total allocatable resources vs total requested
+kubectl describe nodes | grep -A10 "Allocated resources:"
+# Allocated resources:
+#   (Total limits may be over 100 percent, i.e., overcommitted.)
+#   Resource           Requests    Limits
+#   cpu                1250m (62%) 3500m (175%)   ← overcommitted on CPU limits
+#   memory             3584Mi (71%) 7168Mi (143%) ← overcommitted on memory limits
+
+# 7. See how many pods are running per node
+kubectl get pods -n prod -o wide | awk '{print $7}' | sort | uniq -c | sort -rn
+# 3 ip-10-0-1-45.ec2   ← 3 pods on node 1
+# 2 ip-10-0-2-67.ec2   ← 2 pods on node 2
+# 1 ip-10-0-3-89.ec2   ← 1 pod on node 3
+```
+
+---
+
+### What to look for
+
+| Signal | Meaning |
+|--------|---------|
+| `kubectl top pods` memory near limit | Pod is close to OOMKill — investigate or raise limit |
+| `Allocated resources` CPU requests > 80% | Cluster is near full — add a node before the next spike |
+| ResourceQuota `Used` near `Hard` | Next pod create will be rejected by quota |
+| CPU limits > 100% (overcommitted) | OK for CPU (throttling, not kill) — but watch for latency |
+| Memory limits > 100% (overcommitted) | Dangerous — OOMKill can cascade across pods if all spike together |
 
 ---
 
