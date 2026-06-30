@@ -198,7 +198,29 @@ resource "aws_security_group" "main" {
 }
 ```
 
-Without `dynamic`, you would have to hardcode every `ingress {}` block. With it, you pass a list and Terraform generates them. Common use cases: security group rules, IAM policy statements, EKS add-ons.
+**Without `dynamic`** — every ingress rule is a hardcoded block; adding a third rule means editing the resource:
+
+```hcl
+resource "aws_security_group" "main" {
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+```
+
+**With `dynamic`** — you pass a list variable and Terraform generates the blocks; adding a third rule is just a list entry, no resource block change needed.
+
+Common use cases: security group rules, IAM policy statements, EKS add-ons.
 
 ---
 
@@ -332,26 +354,6 @@ State locking ensures only one operation runs at a time. If a second `apply` tri
 
 ---
 
-### Q14. What is the difference between terraform refresh and terraform plan?
-
-`terraform refresh` syncs state with reality — it queries AWS and updates the state file to match the current actual state of resources, without making any infrastructure changes.
-
-`terraform plan` reads the config, reads state (after an implicit refresh), and computes the diff — what needs to be created, updated, or destroyed.
-
-```bash
-# Sync state with real AWS — updates .tfstate but touches nothing in AWS
-terraform refresh
-
-# Show what needs to change — includes a refresh by default
-terraform plan
-
-# Refresh-only plan — shows drift without proposing any changes
-terraform apply -refresh-only
-```
-
-In Terraform ≥ 0.15, `plan` includes a refresh by default. Use `terraform plan -refresh=false` for faster plans when you know nothing has changed externally. Use `-refresh-only` when you suspect drift and want to review it before deciding what to do.
-
----
 
 ### Q15. How do you check what resources are tracked in the Terraform state file?
 
@@ -546,44 +548,102 @@ In zen-infra we use separate directories. A change to `envs/dev/main.tf` only tr
 
 Good module design means no hardcoded values — everything comes from variables, and the module outputs everything callers might need.
 
-In zen-infra the VPC module:
+A complete VPC module has three files inside `modules/vpc/`:
+
+**`modules/vpc/variables.tf`** — everything the module accepts as input, no hardcoded values:
 
 ```hcl
-# modules/vpc/variables.tf
 variable "project" { type = string }
 variable "env"     { type = string }
 variable "vpc_cidr" { type = string }
 variable "public_subnet_cidrs"      { type = list(string) }
 variable "private_eks_subnet_cidrs" { type = list(string) }
 variable "private_rds_subnet_cidrs" { type = list(string) }
-
-# modules/vpc/outputs.tf
-output "vpc_id"                  { value = aws_vpc.main.id }
-output "private_eks_subnet_ids"  { value = aws_subnet.private_eks[*].id }
-output "private_rds_subnet_ids"  { value = aws_subnet.private_rds[*].id }
 ```
 
-Each environment passes its own values:
+**`modules/vpc/main.tf`** — the actual AWS resources, referencing variables via `var.`:
 
 ```hcl
-# dev
-module "vpc" {
-  source                   = "../../modules/vpc"
-  env                      = "dev"
-  vpc_cidr                 = "10.0.0.0/16"
-  private_eks_subnet_cidrs = ["10.0.3.0/24", "10.0.4.0/24"]
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+
+  tags = {
+    Name = "${var.project}-${var.env}-vpc"
+  }
 }
 
-# prod — same module, different sizing
+resource "aws_subnet" "private_eks" {
+  count             = length(var.private_eks_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_eks_subnet_cidrs[count.index]
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "${var.project}-${var.env}-eks-subnet-${count.index}"
+  }
+}
+
+resource "aws_subnet" "private_rds" {
+  count             = length(var.private_rds_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_rds_subnet_cidrs[count.index]
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name = "${var.project}-${var.env}-rds-subnet-${count.index}"
+  }
+}
+
+data "aws_availability_zones" "available" {}
+```
+
+**`modules/vpc/outputs.tf`** — exposes values so the caller (main.tf) can reference them:
+
+```hcl
+output "vpc_id"                 { value = aws_vpc.main.id }
+output "private_eks_subnet_ids" { value = aws_subnet.private_eks[*].id }
+output "private_rds_subnet_ids" { value = aws_subnet.private_rds[*].id }
+```
+
+**`envs/dev/main.tf`** — calls the module and passes environment-specific values; references outputs via `module.vpc.<output_name>`:
+
+```hcl
 module "vpc" {
   source                   = "../../modules/vpc"
-  env                      = "prod"
-  vpc_cidr                 = "10.2.0.0/16"
-  private_eks_subnet_cidrs = ["10.2.3.0/24", "10.2.4.0/24"]
+  project                  = "zen-infra"
+  env                      = "dev"
+  vpc_cidr                 = "10.0.0.0/16"
+  public_subnet_cidrs      = ["10.0.1.0/24", "10.0.2.0/24"]
+  private_eks_subnet_cidrs = ["10.0.3.0/24", "10.0.4.0/24"]
+  private_rds_subnet_cidrs = ["10.0.5.0/24", "10.0.6.0/24"]
+}
+
+module "eks" {
+  source     = "../../modules/eks"
+  vpc_id     = module.vpc.vpc_id                  # consuming vpc output
+  subnet_ids = module.vpc.private_eks_subnet_ids  # consuming vpc output
 }
 ```
 
-Key design rule: modules should never know which environment they are running in — that is always an input. Modules should output everything, even things you do not need yet.
+For prod, same module — just different CIDR values:
+
+```hcl
+# envs/prod/main.tf
+module "vpc" {
+  source                   = "../../modules/vpc"
+  project                  = "zen-infra"
+  env                      = "prod"
+  vpc_cidr                 = "10.2.0.0/16"
+  public_subnet_cidrs      = ["10.2.1.0/24", "10.2.2.0/24"]
+  private_eks_subnet_cidrs = ["10.2.3.0/24", "10.2.4.0/24"]
+  private_rds_subnet_cidrs = ["10.2.5.0/24", "10.2.6.0/24"]
+}
+```
+
+Key design rules:
+- The module (`modules/vpc/`) never hardcodes env names or CIDRs — all inputs come from the caller
+- Resources inside the module reference each other directly (`aws_vpc.main.id`), not via outputs — outputs are only for the caller
+- Output everything the caller might need, even if not used today
 
 ---
 
@@ -608,32 +668,22 @@ Legitimate uses: importing a single resource, debugging a specific resource duri
 
 ### Q24. How do you handle large infrastructure with 100+ resources?
 
-Three main strategies:
-
-**1. Split state by layer:**
+The main strategy is **split by modules**. Instead of one giant `main.tf` with 100+ resources, you group related resources into modules — VPC, EKS, RDS, IAM each become their own module.
 
 ```
-state/
-├── network/     ← VPC, subnets, gateways (changes rarely)
-├── compute/     ← EKS, node groups (changes occasionally)
-└── app/         ← ECR, Secrets Manager (changes frequently)
+modules/
+├── vpc/      ← VPC, subnets, gateways
+├── eks/      ← EKS cluster, node groups
+├── rds/      ← RDS instance, subnet groups
+└── iam/      ← roles, policies
 ```
 
-Lower layers export outputs consumed by upper layers via `terraform_remote_state` data source. Changes to the app layer never risk touching network resources.
+Benefits:
+- A `terraform plan` shows changes by module — easy to review
+- Terraform runs independent modules in parallel, so applies are faster
+- A bug in the RDS module cannot accidentally destroy VPC resources
 
-**2. Use modules aggressively** — group related resources so a `plan` shows meaningful logical changes, not 100 individual resource diffs.
-
-**3. Speed up plans:**
-
-```bash
-# Skip refresh when you know nothing drifted externally
-terraform plan -refresh=false
-
-# Increase parallelism for large applies
-terraform apply -parallelism=20
-```
-
-In zen-infra we keep each environment in one state but split across 6 modules — plans are fast because Terraform parallelises modules that have no dependencies on each other (ECR, IAM, and Secrets Manager all start simultaneously).
+In zen-infra, each environment uses one state file but is split across 6 modules. Modules with no dependency on each other (ECR, IAM, Secrets Manager) all start at the same time during apply.
 
 ---
 
@@ -785,7 +835,33 @@ resource "kubernetes_namespace" "app" {
 
 In zen-infra the EKS module provisions the cluster and OIDC provider. The OIDC provider enables IRSA (IAM Roles for Service Accounts) so pods can assume IAM roles without node-level credentials.
 
-**Word of caution:** Terraform is not the best tool for deploying applications into Kubernetes. It is great for cluster-level resources — namespaces, RBAC, storage classes. For application deployments, Helm or ArgoCD are better suited — they understand rollout strategies, health checks, and rollbacks in ways Terraform does not.
+**What to use Terraform's kubernetes provider for vs what to avoid:**
+
+After the EKS cluster is up, there are two types of things you install:
+
+**Cluster-level setup** (Terraform is fine here):
+```hcl
+resource "kubernetes_namespace" "argocd" {
+  metadata { name = "argocd" }
+}
+```
+Things like namespaces, RBAC roles, storage classes — one-time setup that never changes after creation.
+
+**Application installs — ArgoCD, ingress-nginx, metrics-server** (do NOT use Terraform):
+
+In zen-infra these are installed via shell scripts after cluster creation:
+```bash
+helm install argocd argo/argo-cd -n argocd
+helm install ingress-nginx ingress-nginx/ingress-nginx
+kubectl apply -f metrics-server.yaml
+```
+
+Terraform is the wrong tool for this because:
+- It has no concept of pod health or rollout status — it marks a helm release "done" the moment the API call succeeds, even if pods are crashing
+- Helm and ArgoCD understand upgrades, rollbacks, and health checks natively
+- Application versions change frequently — you don't want a `terraform apply` accidentally touching your cluster every time
+
+**Rule of thumb:** Terraform provisions the cluster. Shell scripts / Helm / ArgoCD install what runs inside it.
 
 ---
 
@@ -976,25 +1052,6 @@ In zen-infra, all three environments share the same modules. Adding staging mean
 
 ---
 
-### Q37. Your pipeline keeps timing out waiting for an EKS cluster. How do you fix it?
-
-EKS clusters take 15-20 minutes to provision. Terraform has default resource-level timeouts and the CI runner has a job-level timeout.
-
-```hcl
-resource "aws_eks_cluster" "main" {
-  ...
-  timeouts {
-    create = "30m"
-    delete = "20m"
-  }
-}
-```
-
-Also check your pipeline job timeout — GitHub Actions defaults to 6 hours but some configs set it lower.
-
-Beyond timeouts, this can also be a missing `depends_on`. If Terraform starts configuring the cluster before the IAM role policy attachment is propagated, the cluster creation will fail. IAM changes in AWS can take 10-30 seconds to propagate globally. Adding an explicit `depends_on` to the IAM attachments usually fixes this.
-
----
 
 ### Q38. You changed one value but the plan shows the resource being recreated. How do you investigate?
 
@@ -1110,26 +1167,45 @@ No other module is affected because `module.ecr` has no outputs that feed into o
 
 ---
 
-### Q42. A junior engineer ran `terraform apply` directly from their laptop and accidentally changed the EKS node group instance type from `t3.small` to `t3.large`. The pipeline runs the next day and shows a plan with 0 changes. Why? How do you detect and fix this?
+### Q42. A junior engineer bypassed the pipeline and changed infra directly from their laptop. The pipeline the next day shows 0 changes. Why? How do you detect it?
+
+**Scenario:**
+- The team's approved workflow is: PR → merge to `main` → GitHub Actions runs `terraform apply` using an S3 backend
+- A junior has the same repo cloned locally, with the same S3 backend configured
+- The junior changes `node_instance_type = "t3.small"` → `"t3.large"` in their local `.tf` file
+- They push that change **directly to `main`** (no PR review) and run `terraform apply` from their laptop
+- The pipeline runs the next day and reports **0 changes**
 
 <details>
 <summary>Expected answer</summary>
 
-The pipeline showed 0 changes because the `t3.large` is now the **real state in AWS**, and it matches the state file in S3. Terraform compares code → state file → real AWS. If the state file was updated by the local apply, Terraform thinks everything is already correct.
+**Why 0 changes?**
 
-To detect drift:
-```bash
-cd envs/dev
-terraform plan \
-  -var="db_password=dummy" \
-  -var="jwt_secret=dummy" \
-  -var="github_org=your-username"
-# If the plan shows changes that nobody approved, that is drift
-```
+Terraform compares three things: `.tf` code → S3 state file → real AWS. After the junior's actions, all three are in sync at `t3.large`:
 
-To fix: revert `node_instance_type` in `envs/dev/main.tf` back to `t3.small`, open a PR, let the pipeline plan show the change, then merge and approve.
+| | Value |
+|---|---|
+| GitHub `main` code | `t3.large` (junior pushed directly) |
+| S3 state file | `t3.large` (local apply updated it) |
+| Real AWS node group | `t3.large` (local apply changed it) |
 
-Prevention: the pipeline uses a GitHub Environment with required reviewers. Nobody should have `terraform apply` access from a laptop in a real team — the IAM user used locally should be read-only.
+Terraform sees no difference between desired (code) and actual (state + AWS) → plan is empty.
+
+**How to detect it:**
+
+Terraform won't catch this — you need out-of-band signals:
+
+- `git log main` — shows a direct commit to `main` instead of a PR merge commit
+- **AWS CloudTrail** — the API call that modified the node group will show the junior's IAM user, not the GitHub Actions role
+- **AWS Cost Anomaly Detection** — `t3.large` costs more than `t3.small`; a cost spike triggers an alert
+
+**Fix:**
+1. Revert the code change via a proper PR (`node_instance_type` back to `"t3.small"`)
+2. Merge the PR → pipeline runs, plans the revert (`t3.large` → `t3.small`), gets reviewed and applied
+
+**Prevention:**
+- **GitHub branch protection on `main`** — require a PR with at least one reviewer approval; direct pushes are blocked
+- **Read-only local IAM credentials** — engineer's local AWS credentials can only read; `terraform apply` from a laptop fails with an authorization error before touching anything
 
 </details>
 
