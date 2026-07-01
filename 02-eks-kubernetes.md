@@ -1,14 +1,14 @@
 # EKS & Kubernetes — Interview Questions
 
 > Grounded in the zen-pharma EKS 1.33 cluster with IRSA, External Secrets, ArgoCD, and NGINX Ingress.
-> 25 questions across EKS setup, Kubernetes concepts, incident response, and live troubleshooting.
+> 24 questions across EKS setup, Kubernetes concepts, incident response, and live troubleshooting.
 
 ---
 
 ## Table of Contents
 
-1. [EKS Concepts & IRSA](#1-eks-concepts--irsa) — Q1–Q3
-2. [Kubernetes Concepts](#2-kubernetes-concepts) — Q4–Q7
+1. [EKS Concepts & IRSA](#1-eks-concepts--irsa) — Q1–Q2
+2. [Kubernetes Concepts](#2-kubernetes-concepts) — Q3–Q6
 3. [Incident Response Scenarios](#3-incident-response-scenarios) — Q8–H9
 4. [Troubleshooting Commands Reference](#4-troubleshooting-commands-reference) — I1–I7
 5. [Scenario Troubleshooting](#5-scenario-troubleshooting) — Q24–Q25
@@ -85,42 +85,11 @@ Here is how it works step by step in the zen-pharma project:
 
 ---
 
-**Q3.** The `argocd-application-controller` pod is crashing with an `Unauthorized` error when trying to sync resources. What would you check?
-
-<details>
-<summary>Expected answer</summary>
-
-The ArgoCD IRSA role (`modules/iam/main.tf`) has a trust policy condition:
-
-```hcl
-"system:serviceaccount:argocd:argocd-application-controller"
-```
-
-Check in this order:
-
-1. **Namespace name** — is ArgoCD actually installed in the `argocd` namespace? If it was installed in `argocd-system` or another namespace, the trust condition never matches and STS rejects the token.
-
-2. **Service account annotation** — the Helm values for ArgoCD must annotate the service account with the role ARN:
-   ```yaml
-   serviceAccount:
-     annotations:
-       eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/zen-pharma-dev-argocd-role
-   ```
-   If this annotation is missing, Kubernetes does not project the OIDC token into the pod.
-
-3. **OIDC provider ARN** — verify `var.oidc_provider_arn` in `modules/iam` received the correct value from `module.eks.oidc_provider_arn`. A mismatch means the trust policy references a different cluster's OIDC provider.
-
-4. **ArgoCD role has no AWS permissions attached** — this is correct. The role exists purely for EKS authentication. ArgoCD's access to Kubernetes resources is controlled by K8s RBAC (the `aws-auth` ConfigMap), not IAM policies.
-
-</details>
-
----
-
 ## 2. Kubernetes Concepts
 
 ---
 
-**Q4.** What is Helm and how does it relate to your GitOps values files?
+**Q3.** What is Helm and how does it relate to your GitOps values files?
 
 <details>
 <summary>Expected answer</summary>
@@ -133,7 +102,7 @@ Helm is a Kubernetes package manager. A Helm chart is a parameterised template f
 
 ---
 
-**Q5.** What happens in Kubernetes during a rolling update?
+**Q4.** What happens in Kubernetes during a rolling update?
 
 <details>
 <summary>Expected answer</summary>
@@ -144,7 +113,7 @@ A rolling update gradually replaces old pods with new ones. Kubernetes creates a
 
 ---
 
-**Q6.** What is a Kubernetes readiness probe vs a liveness probe?
+**Q5.** What is a Kubernetes readiness probe vs a liveness probe?
 
 <details>
 <summary>Expected answer</summary>
@@ -155,7 +124,7 @@ A readiness probe determines whether a pod is ready to receive traffic — if it
 
 ---
 
-**Q7.** What is a Kyverno policy and how does it enforce security at the cluster level?
+**Q6.** What is a Kyverno policy and how does it enforce security at the cluster level?
 
 <details>
 <summary>Expected answer</summary>
@@ -403,17 +372,6 @@ kubectl get secret -n prod | grep ecr
 
 ---
 
-### Cause 7: Topology spread constraints too strict
-
-From `helm-charts/values.yaml`, `topologySpreadConstraints: []` by default. But if set:
-```bash
-# If maxSkew: 1 and only 2 zones available with 3 pods → can't schedule
-# "0/3 nodes are available: 3 node(s) didn't match pod topology spread constraints"
-kubectl describe pod auth-service-<hash> -n prod | grep -A5 "TopologySpreadConstraints"
-```
-
----
-
 ### Quick isolation flowchart
 
 ```
@@ -425,7 +383,6 @@ Pod Pending for >2 min
                ├── "unbound PVC" → check storage class, PVC status
                ├── "didn't match node selector" → check node labels
                ├── "didn't match taint" → check node taints + pod tolerations
-               ├── "didn't match topology spread" → relax maxSkew or add nodes
                ├── "quota exceeded" → check ResourceQuota
                └── "no events at all" → scheduler overwhelmed, check kube-scheduler logs
 ```
@@ -658,18 +615,6 @@ argocd app history auth-service-prod
 
 ---
 
-**Cause 4: Helm rendering is non-deterministic**
-
-Some Helm charts use `randAlphaNum` or `now` in templates — these generate different values on each render. ArgoCD re-renders on every sync cycle and sees a difference every time.
-
-```bash
-argocd app diff auth-service-prod | grep -i rand
-```
-
-**Fix:** Replace dynamic values in Helm templates with static values or use a Kubernetes Secret with a stable value set at install time.
-
----
-
 ### Decision flow before syncing
 
 ```
@@ -679,9 +624,8 @@ ArgoCD shows OutOfSync
                │
                ├── Only annotations/metadata → likely admission controller → add ignoreDifferences
                ├── Replica count only → HPA active → add ignoreDifferences for /spec/replicas
-               ├── Actual config change → check git log, someone may have manually changed cluster
-               │         → review diff, if OK, add to git, then sync
-               └── Random-looking value → non-deterministic Helm template → fix template
+               └── Actual config change → check git log, someone may have manually changed cluster
+                         → review diff, if OK, add to git, then sync
 ```
 
 **Never blindly sync OutOfSync.** Always run `argocd app diff` first to understand what changed.
@@ -1657,100 +1601,6 @@ kubectl get pods -n prod -o wide | awk '{print $7}' | sort | uniq -c | sort -rn
 | ResourceQuota `Used` near `Hard` | Next pod create will be rejected by quota |
 | CPU limits > 100% (overcommitted) | OK for CPU (throttling, not kill) — but watch for latency |
 | Memory limits > 100% (overcommitted) | Dangerous — OOMKill can cascade across pods if all spike together |
-
----
-
-
-## I6
-
-### Question
-> "A Helm upgrade failed halfway through and left the release in a broken state. Walk me through diagnosing and recovering it."
-
----
-
-### Diagnosis
-
-```bash
-# 1. Check release status
-helm list -n prod
-# NAME            NAMESPACE  REVISION  STATUS          CHART
-# auth-service    prod       5         failed          pharma-service-1.0.0
-
-helm status auth-service -n prod
-# STATUS: failed
-# LAST DEPLOYED: Thu May 07 02:15:00 2026
-# NOTES: ...
-
-# 2. See the full history
-helm history auth-service -n prod
-# REVISION  UPDATED     STATUS      CHART                    DESCRIPTION
-# 1         ...         superseded  pharma-service-1.0.0    Install complete
-# 2         ...         superseded  pharma-service-1.0.0    Upgrade complete
-# 3         ...         superseded  pharma-service-1.0.0    Upgrade complete
-# 4         ...         superseded  pharma-service-1.0.0    Upgrade complete
-# 5         ...         failed      pharma-service-1.0.0    Upgrade failed: ...
-
-# 3. See what changed in the failed revision
-helm get manifest auth-service -n prod --revision 5 > /tmp/failed.yaml
-helm get manifest auth-service -n prod --revision 4 > /tmp/previous.yaml
-diff /tmp/previous.yaml /tmp/failed.yaml
-
-# 4. Check the actual K8s resources for inconsistency
-kubectl get deployments,services,configmaps -n prod -l app.kubernetes.io/instance=auth-service
-```
-
----
-
-### Recovery options
-
-**Option A: Rollback to last good revision (most common)**
-```bash
-helm rollback auth-service 4 -n prod
-# Rolls back to revision 4
-
-# Verify
-helm status auth-service -n prod
-# STATUS: deployed
-```
-
-**Option B: Force upgrade with --cleanup-on-fail (if rollback not working)**
-```bash
-helm upgrade auth-service ./helm-charts \
-  -n prod \
-  -f envs/prod/values-auth-service.yaml \
-  --cleanup-on-fail \    # delete new resources if upgrade fails
-  --atomic               # rollback automatically if upgrade fails
-```
-
-**Option C: Nuclear option — uninstall and reinstall**
-```bash
-# ONLY if rollback is not working
-# WARNING: brief downtime
-
-helm uninstall auth-service -n prod
-# Wait for resources to clean up
-kubectl get pods -n prod | grep auth-service
-
-helm install auth-service ./helm-charts \
-  -n prod \
-  -f envs/prod/values-auth-service.yaml
-```
-
----
-
-### Why do Helm upgrades fail halfway?
-
-Common causes in this repo's setup:
-1. **Job hook failed** — if a pre-upgrade hook (e.g., DB migration) fails, upgrade is marked failed but some resources were already updated
-2. **Readiness timeout** — new pod never becomes ready within `--timeout` (default 5min); Helm marks as failed but deployment exists
-3. **Immutable field change** — tried to change a field like `selector.matchLabels` which can't be updated; the Deployment object is stuck
-4. **Resource conflict** — a resource already exists that Helm didn't create (not in its release history)
-
-For the immutable field case:
-```bash
-kubectl delete deployment auth-service -n prod
-helm upgrade auth-service ./helm-charts -n prod -f envs/prod/values-auth-service.yaml
-```
 
 ---
 
