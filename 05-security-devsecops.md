@@ -9,10 +9,10 @@
 
 1. [Container Security](#1-container-security) — Q1–Q4
 2. [SAST & Code Scanning](#2-sast--code-scanning) — Q5–Q8
-3. [Dependency & Image Scanning](#3-dependency--image-scanning) — Q9–Q12
-4. [Supply Chain Security](#4-supply-chain-security) — Q13–Q16
-5. [AWS IAM & OIDC](#5-aws-iam--oidc) — Q17–Q22
-6. [DevSecOps Philosophy](#6-devsecops-philosophy) — Q23–Q25
+3. [Dependency & Image Scanning](#3-dependency--image-scanning) — Q9–Q11
+4. [Supply Chain Security](#4-supply-chain-security) — Q12–Q14
+5. [AWS IAM & OIDC](#5-aws-iam--oidc) — Q15–Q20
+6. [DevSecOps Philosophy](#6-devsecops-philosophy) — Q21–Q23
 7. [External Secrets Operator](#7-external-secrets-operator) — C2–C3
 
 ---
@@ -25,6 +25,50 @@
 
 - **What is being tested:** Container image hygiene.
 - **Strong answer:** A multi-stage build uses multiple `FROM` instructions. Early stages contain build tools (Maven, JDK SDK, npm). The final stage copies only the compiled artifact from the build stage — no Maven, no JDK, no source code, no node_modules dev dependencies make it into the production image. This reduces image size (smaller attack surface), removes tools that have no business in a runtime container (Maven could be used to download arbitrary JARs if compromised), and reduces the number of CVEs Trivy finds because fewer packages are present.
+
+**Sample Dockerfile (Spring Boot / Maven, matching this project's stack):**
+
+```dockerfile
+# ---- Stage 1: build ----
+FROM eclipse-temurin:17-jdk-alpine AS build
+WORKDIR /app
+
+# Copy only the POM first so Docker can cache the dependency layer
+# separately from source changes — deps only re-download when the POM changes
+COPY pom.xml .
+COPY .mvn/ .mvn/
+COPY mvnw .
+RUN ./mvnw dependency:go-offline -B
+
+# Now copy source and build — this layer invalidates on every code change,
+# but the dependency layer above stays cached
+COPY src ./src
+RUN ./mvnw clean package -DskipTests -B
+
+# ---- Stage 2: runtime ----
+FROM eclipse-temurin:17-jre-alpine AS runtime
+WORKDIR /app
+
+# Non-root user — see Q2. Alpine's `addgroup`/`adduser`, not useradd/groupadd
+ARG UID=1000
+ARG GID=1000
+RUN addgroup -g ${GID} appgroup && \
+    adduser -D -u ${UID} -G appgroup appuser
+
+# Only the compiled JAR crosses the stage boundary — no Maven, no JDK,
+# no source code, no ~/.m2 cache make it into this image
+COPY --from=build --chown=appuser:appgroup /app/target/*.jar app.jar
+
+USER appuser
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+Why each piece matters for security specifically, not just image size:
+- **`eclipse-temurin:17-jdk-alpine` never reaches the final image** — the full JDK includes `jshell`, `jdb`, `javac`, and other tooling an attacker could use to compile and run arbitrary code inside a compromised container. The runtime stage only has the JRE, which can *execute* bytecode but not compile or debug it.
+- **`COPY --from=build` is the actual security boundary** — it's a deliberate allowlist (only `/app/target/*.jar` crosses over) rather than a denylist of things to remove after the fact. Nothing from the build stage exists in the final image unless this line explicitly copies it.
+- **`--chown=appuser:appgroup` on the COPY, plus `USER appuser` before `ENTRYPOINT`** — the JAR is owned by and runs as UID 1000, not root, tying directly into the Q2 answer about limiting blast radius on container escape.
+- **Splitting `COPY pom.xml` from `COPY src`** is a build-cache optimization, not a security control, but it's worth knowing: without it, every source change invalidates the dependency-download layer too, making iterative builds far slower — which is a big part of *why* teams reach for multi-stage builds like this instead of skipping the caching step.
 
 ---
 
@@ -100,14 +144,7 @@
 
 ---
 
-**Q11: What does `ignore-unfixed` mean in Trivy and why is it used?**
-
-- **What is being tested:** Practical scanning operations knowledge.
-- **Strong answer:** `ignore-unfixed: true` tells Trivy to report CVEs that have no available patched version but not to fail the build on them. If a CVE exists in a base OS package and the vendor has not yet released a fix, failing the build gives you no actionable path — you cannot update a package that has no update available. You would be permanently blocked. `ignore-unfixed` means the build only fails when a fix exists, i.e. there is something you can actually do. Unfixed CVEs still appear in the SARIF report for visibility and can be tracked separately.
-
----
-
-**Q12: What is the difference between OWASP Dependency Check and Trivy?**
+**Q11: What is the difference between OWASP Dependency Check and Trivy?**
 
 - **What is being tested:** Understanding the different scanning surfaces.
 - **Strong answer:** OWASP Dependency Check scans your declared source dependencies — what's listed in `pom.xml` or `package.json` — against the NVD. It runs before Docker build and catches vulnerable libraries in your application code. Trivy scans the built container image — OS-level packages installed by the Dockerfile base image, the JRE runtime, and all native libraries bundled inside the image. A vulnerable `libssl` in the Alpine base layer or a vulnerable `glibc` would only be caught by Trivy. A vulnerable Spring Boot version would be caught by both but OWASP Dep Check catches it earlier. Both are needed because they scan different surfaces.
@@ -118,28 +155,21 @@
 
 ---
 
-**Q13: What is supply chain security in the context of container images?**
+**Q12: What is supply chain security in the context of container images?**
 
 - **What is being tested:** Whether you understand attacks beyond code vulnerabilities.
 - **Strong answer:** Supply chain attacks target the build and distribution pipeline rather than the application code itself. A classic example: SolarWinds — attackers compromised the build system, not the source code. For containers, the threats include: a malicious dependency injected via a compromised package registry, a rogue image pushed directly to ECR bypassing CI, a developer manually pushing a backdoored image. Supply chain security controls include: signing images at build time (Cosign), verifying signatures at deploy time (Kyverno), generating SBOMs to know exactly what's in an image, and pinning dependencies to specific digest-verified versions.
 
 ---
 
-**Q14: How does Cosign keyless signing work?**
+**Q13: How does Cosign keyless signing work?**
 
 - **What is being tested:** Sigstore ecosystem knowledge.
 - **Strong answer:** Keyless signing uses the workflow's OIDC identity instead of a long-lived private key. The process: (1) GitHub Actions generates an OIDC token that cryptographically identifies the workflow run and repository, (2) Cosign sends this token to Fulcio, a certificate authority in the Sigstore ecosystem, (3) Fulcio verifies the OIDC token and issues a short-lived X.509 certificate (valid for ~10 minutes) that encodes the workflow identity, (4) Cosign signs the image digest using this certificate, (5) the signature and certificate are written to the Rekor public transparency log — a tamper-evident, append-only ledger. There are no long-lived signing keys to manage, rotate, or leak.
 
 ---
 
-**Q15: What is Rekor and why is transparency important?**
-
-- **What is being tested:** Depth of Sigstore knowledge.
-- **Strong answer:** Rekor is a public, append-only transparency log maintained by the Sigstore project. Every Cosign signature is recorded in Rekor with a timestamped, tamper-evident log entry. Transparency means: anyone can verify that a signature was produced by a specific identity at a specific time. It also means that if a signing identity is compromised, the compromise is detectable — you can audit the log and see signatures that should not have been made. This is similar to Certificate Transparency logs used for TLS certificates.
-
----
-
-**Q16: How does Kyverno enforce image signing at the Kubernetes admission level?**
+**Q14: How does Kyverno enforce image signing at the Kubernetes admission level?**
 
 - **What is being tested:** End-to-end supply chain enforcement knowledge.
 - **Strong answer:** Kyverno is a Kubernetes-native policy engine that runs as an admission webhook. When a pod is submitted to the API server, the request passes through Kyverno before being accepted. A Kyverno `ClusterPolicy` with `verifyImages` rules instructs Kyverno to check that the image has a valid Cosign signature in Rekor, signed by a specific identity (e.g. the GitHub Actions OIDC identity for your repo). If the signature is missing or invalid, Kyverno rejects the pod with an admission error — the pod never starts. This means even if someone pushes a rogue image directly to ECR, it cannot run in the cluster.
@@ -150,28 +180,28 @@
 
 ---
 
-**Q17: Why is OIDC-based authentication preferred over long-lived IAM access keys for CI/CD?**
+**Q15: Why is OIDC-based authentication preferred over long-lived IAM access keys for CI/CD?**
 
 - **What is being tested:** Cloud security fundamentals.
 - **Strong answer:** Long-lived access keys have several problems: they don't expire, so a leaked key provides persistent access until manually rotated; they are often accidentally committed to source code or exposed in build logs; rotation is a manual operational burden; they need to be stored as secrets and managed. OIDC eliminates all of these: credentials are generated per workflow run, are scoped to that run only, expire when the run ends (~15 minutes), and there is nothing to store, rotate, or leak. The trust relationship is established cryptographically via the OIDC provider — the IAM role trusts JWT tokens signed by GitHub's OIDC provider for a specific repository and branch.
 
 ---
 
-**Q18: How do you scope an IAM role to be as least-privileged as possible for ECR push?**
+**Q16: How do you scope an IAM role to be as least-privileged as possible for ECR push?**
 
 - **What is being tested:** IAM security knowledge.
 - **Strong answer:** The IAM role for CI should have exactly the permissions needed for ECR push and nothing else: `ecr:GetAuthorizationToken` (to get a login token), `ecr:BatchCheckLayerAvailability`, `ecr:PutImage`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`. These should be scoped to specific ECR repository ARNs, not `*`. The trust policy should specify the exact GitHub repository and optionally the branch using the `sub` claim condition — e.g. `repo:myorg/myrepo:ref:refs/heads/develop` — so even if another repository somehow obtained a GitHub OIDC token, it could not assume this role.
 
 ---
 
-**Q19: What is the `sub` claim in a GitHub OIDC token and why does it matter?**
+**Q17: What is the `sub` claim in a GitHub OIDC token and why does it matter?**
 
 - **What is being tested:** OIDC token structure knowledge.
 - **Strong answer:** The `sub` (subject) claim identifies the entity requesting the token. For GitHub Actions it takes the form `repo:<owner>/<repo>:ref:refs/heads/<branch>` or `repo:<owner>/<repo>:environment:<env>`. The IAM trust policy `StringEquals` condition on the `sub` claim is what prevents other repositories or branches from assuming the role. Without scoping the `sub` claim, any workflow in any repository could assume the role as long as it uses GitHub's OIDC provider. Always lock down the `sub` claim to the specific repo and optionally branch or environment.
 
 ---
 
-**Q20: A security audit flags that your RDS password is visible in the Terraform state file. How do you respond?**
+**Q18: A security audit flags that your RDS password is visible in the Terraform state file. How do you respond?**
 
 <details>
 <summary>Expected answer</summary>
@@ -192,7 +222,7 @@ Mitigations already in place in zen-pharma:
 
 ---
 
-**Q21: You need to give a new team member `read-only` access to see what Terraform would change, but not be able to apply. How do you set this up?**
+**Q19: You need to give a new team member `read-only` access to see what Terraform would change, but not be able to apply. How do you set this up?**
 
 <details>
 <summary>Expected answer</summary>
@@ -217,7 +247,7 @@ Attach it to the new team member's IAM user. They can run `terraform plan` (whic
 
 ---
 
-**Q22: The GitHub Actions OIDC role has `max_session_duration = 3600`. A CI job for building Docker images is taking 75 minutes because the image is very large. What happens and how do you fix it?**
+**Q20: The GitHub Actions OIDC role has `max_session_duration = 3600`. A CI job for building Docker images is taking 75 minutes because the image is very large. What happens and how do you fix it?**
 
 <details>
 <summary>Expected answer</summary>
@@ -246,21 +276,21 @@ Option 1 is the immediate fix. Option 2 is the right long-term fix.
 
 ---
 
-**Q23: What does "shift-left security" mean?**
+**Q21: What does "shift-left security" mean?**
 
 - **What is being tested:** Core DevSecOps philosophy.
 - **Strong answer:** In a traditional SDLC, security testing happened at the end — a penetration test or security review before release. Problems found at that stage are expensive to fix: the code is already written, deployed to staging, and reviewed. Shift-left means moving security checks earlier in the development process — ideally to the developer's own machine or at minimum to the first CI run on a feature branch. The earlier a security issue is found, the cheaper and faster it is to fix. A SAST finding on a feature branch takes minutes to fix. The same finding after merging to main, building an image, and deploying to staging takes hours. After reaching production, it may require a CVE disclosure, customer notification, and emergency hotfix.
 
 ---
 
-**Q24: What is an SBOM and why is it increasingly required?**
+**Q22: What is an SBOM and why is it increasingly required?**
 
 - **What is being tested:** Supply chain security awareness, compliance trends.
 - **Strong answer:** An SBOM (Software Bill of Materials) is a machine-readable inventory of all components in a software artifact — every library, version, and license. It is the equivalent of an ingredient list for software. When a new CVE is disclosed (like Log4Shell), organisations with an SBOM can immediately query it to find which services are affected. Without one, they have to manually audit every service. US Executive Order 14028 (2021) mandates SBOMs for software sold to US federal agencies. Tools like Syft (Anchore) generate SBOMs from container images. Trivy can also generate SBOMs in CycloneDX or SPDX format.
 
 ---
 
-**Q25: How do you balance security gate strictness with developer velocity?**
+**Q23: How do you balance security gate strictness with developer velocity?**
 
 - **What is being tested:** Pragmatic DevSecOps thinking.
 - **Strong answer:** The key is making security gates fast, actionable, and with a clear path to resolution. If a gate takes 20 minutes and produces 50 findings with no clear owner, developers learn to ignore it. Good practices: (1) Run lightweight checks (SAST, unit tests) on feature branches for fast feedback — not just at merge, (2) Set thresholds that are achievable — CVSS ≥ 7.0 rather than ≥ 4.0 to avoid alert fatigue, (3) Use `ignore-unfixed` in Trivy to not block on unfixable issues, (4) Keep the full image build pipeline for merged code only — don't run Trivy and ECR push on every feature branch commit, (5) Provide clear error messages with remediation guidance, not just "build failed."

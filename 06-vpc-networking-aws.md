@@ -1,15 +1,17 @@
 # VPC, Networking & AWS Infrastructure — Interview Questions
 
 > Grounded in the zen-infra VPC module: 3-tier subnet design, single NAT Gateway, EKS subnets with K8s tags, RDS in private subnets.
-> 10 questions covering networking fundamentals, troubleshooting, and AWS-specific gotchas.
+> 18 questions covering networking fundamentals, troubleshooting, and AWS-specific gotchas.
 
 ---
 
 ## Table of Contents
 
 1. [VPC & Networking Scenarios](#1-vpc--networking-scenarios) — Q1–Q3
-2. [Access & Connectivity Troubleshooting](#2-access--connectivity-troubleshooting) — Q4–Q6
-3. [AWS Networking Concepts](#3-aws-networking-concepts) — Q7–Q10
+2. [Access & Connectivity Troubleshooting](#2-access--connectivity-troubleshooting) — Q4–Q5
+3. [AWS Networking Concepts](#3-aws-networking-concepts) — Q6–Q8
+4. [AWS Networking Concepts — Advanced](#4-aws-networking-concepts--advanced) — Q9–Q13
+5. [AWS Infrastructure Concepts (Beyond Networking)](#5-aws-infrastructure-concepts-beyond-networking) — Q14–Q18
 
 ---
 
@@ -83,40 +85,7 @@ These tags cost nothing and forgetting them is a very common real-world mistake.
 
 ## 2. Access & Connectivity Troubleshooting
 
-**Q4.** You just ran `terraform apply` and the EKS cluster was created, but `kubectl get nodes` shows 0 nodes after 10 minutes. What do you check?
-
-<details>
-<summary>Expected answer</summary>
-
-Check in this order:
-
-1. **Node group IAM role** — the three policy attachments in `modules/eks/main.tf` must exist before the node group. If `terraform apply` failed between creating the role and attaching the policies, nodes will spin up but cannot join the cluster (no `AmazonEKSWorkerNodePolicy`).
-
-2. **`depends_on` in `aws_eks_node_group`** — the code has:
-   ```hcl
-   depends_on = [
-     aws_iam_role_policy_attachment.node_AmazonEKSWorkerNodePolicy,
-     aws_iam_role_policy_attachment.node_AmazonEKS_CNI_Policy,
-     aws_iam_role_policy_attachment.node_AmazonEC2ContainerRegistryReadOnly,
-   ]
-   ```
-   If a partial apply happened, this dependency chain may not have completed.
-
-3. **Subnet IDs** — check that `var.subnet_ids` received the private EKS subnet IDs (not the RDS subnets, not the public subnets).
-
-4. **`aws-auth` ConfigMap** — the cluster was created with `bootstrap_cluster_creator_admin_permissions = true`. If a different IAM identity created the cluster vs. what you are using for `kubectl`, you may need to add your IAM role to `aws-auth`.
-
-```bash
-aws eks update-kubeconfig --region us-east-1 --name zen-pharma-dev-cluster
-kubectl get nodes
-kubectl describe node <node-name>  # check events
-```
-
-</details>
-
----
-
-**Q5.** After a `terraform apply` succeeds, a developer runs `kubectl apply -f deployment.yaml` and the pod fails to start with `ImagePullBackOff`. Walk through your debugging steps.
+**Q4.** After a `terraform apply` succeeds, a developer runs `kubectl apply -f deployment.yaml` and the pod fails to start with `ImagePullBackOff`. Walk through your debugging steps.
 
 <details>
 <summary>Expected answer</summary>
@@ -148,7 +117,7 @@ Possible causes and checks:
 
 ---
 
-**Q6.** You are paged at 2 AM: the pharma application is returning 503 errors. `kubectl get pods` shows all pods `Running`. `kubectl get nodes` shows all nodes `Ready`. Where do you look next?
+**Q5.** You are paged at 2 AM: the pharma application is returning 503 errors. `kubectl get pods` shows all pods `Running`. `kubectl get nodes` shows all nodes `Ready`. Where do you look next?
 
 <details>
 <summary>Expected answer</summary>
@@ -190,7 +159,7 @@ The most common 2 AM cause after "everything looks fine": the NLB target group h
 
 ## 3. AWS Networking Concepts
 
-**Q7.** What is the difference between a Security Group and a Network ACL in the zen-infra VPC?
+**Q6.** What is the difference between a Security Group and a Network ACL in the zen-infra VPC?
 
 <details>
 <summary>Expected answer</summary>
@@ -207,7 +176,7 @@ Key interview point: security groups are the primary tool; NACLs are a secondary
 
 ---
 
-**Q8.** Why does zen-infra use a single NAT Gateway in dev? What would you change for production?
+**Q7.** Why does zen-infra use a single NAT Gateway in dev? What would you change for production?
 
 <details>
 <summary>Expected answer</summary>
@@ -224,27 +193,7 @@ In zen-infra: `modules/vpc/main.tf` creates `aws_nat_gateway.main` with `count =
 
 ---
 
-**Q9.** What are the two required Kubernetes tags on the private EKS subnets and what breaks without each one?
-
-<details>
-<summary>Expected answer</summary>
-
-```hcl
-"kubernetes.io/role/internal-elb" = "1"
-"kubernetes.io/cluster/${var.project}-${var.env}-cluster" = "owned"
-```
-
-Without `kubernetes.io/role/internal-elb = 1`: The AWS Load Balancer Controller cannot discover which subnets to use for internal load balancers. Any Kubernetes Service of type LoadBalancer or Ingress stays in Pending state indefinitely — the pod and service are healthy but no LB is provisioned. This is the most common silent failure on new EKS clusters.
-
-Without `kubernetes.io/cluster/...-cluster = owned`: EKS cannot manage subnet resources for node placement, and the VPC CNI plugin may struggle to allocate pod IPs.
-
-These tags cost nothing. Forgetting them is the most common networking mistake on new EKS clusters.
-
-</details>
-
----
-
-**Q10.** How does the EKS VPC CNI plugin assign IPs to pods, and what happens if a subnet runs out of IPs?
+**Q8.** How does the EKS VPC CNI plugin assign IPs to pods, and what happens if a subnet runs out of IPs?
 
 <details>
 <summary>Expected answer</summary>
@@ -256,5 +205,174 @@ The consequence: a /24 subnet (256 IPs) minus 5 reserved by AWS = 251 usable IPs
 If a subnet runs out of IPs: new pods fail to start with `Failed to allocate address` in the kubelet logs. The fix is larger subnets (/22 gives 1019 IPs) or **prefix delegation** (VPC CNI v1.9+) which assigns /28 blocks instead of individual IPs, multiplying capacity 16x without subnet changes.
 
 In zen-infra, the private EKS subnets are /24 — fine for dev scale but undersized for production. A production sizing recommendation is /22 per AZ.
+
+</details>
+
+---
+
+## 4. AWS Networking Concepts — Advanced
+
+**Q9.** What is a VPC Gateway Endpoint vs an Interface Endpoint (PrivateLink), and where would you use each?
+
+<details>
+<summary>Expected answer</summary>
+
+**Gateway Endpoint** — supports only **S3** and **DynamoDB**. It works by adding a route in the route table that sends traffic for the service's public IP ranges to the endpoint instead of the NAT Gateway. It's free and adds no extra network hop cost.
+
+**Interface Endpoint (AWS PrivateLink)** — creates an **ENI with a private IP** in your subnet for the target service (e.g. `ecr.api`, `ecr.dkr`, `secretsmanager`, `sts`, `logs`). Traffic goes over AWS's private backbone, never touching the internet or the NAT Gateway. Costs an hourly charge per AZ plus per-GB data processing.
+
+Why this matters in zen-infra: EKS nodes in private subnets pull images from ECR and call Secrets Manager/STS through the **single NAT Gateway** today. Under load, or if the NAT Gateway is down, all of that traffic breaks. Adding interface endpoints for `ecr.api`, `ecr.dkr`, `s3` (as a gateway endpoint), `secretsmanager`, and `sts` removes that dependency entirely — pods keep working even if the NAT Gateway is unavailable, and you cut NAT data-processing costs for what is usually the bulk of private-subnet egress traffic.
+
+</details>
+
+---
+
+**Q10.** What is the difference between VPC Peering and a Transit Gateway, and when would zen-infra need to move from one to the other?
+
+<details>
+<summary>Expected answer</summary>
+
+**VPC Peering** connects exactly two VPCs directly. It is not transitive — if VPC A peers with B, and B peers with C, A cannot reach C through B. Each peering connection needs its own route table entries in both VPCs, and CIDR ranges must not overlap.
+
+**Transit Gateway (TGW)** is a regional hub-and-spoke router. Every attached VPC (and VPN/Direct Connect connection) gets one attachment to the TGW, and TGW route tables control which spokes can reach which. It scales to hundreds of VPCs without the N² peering-connection problem.
+
+zen-infra today is a single VPC, so neither is in play yet. The trigger to introduce one: a second VPC appears — e.g. a shared-services VPC for CI runners, or a separate VPC per environment (dev/staging/prod) that still needs to reach a central logging or artifact-registry VPC. With 2–3 VPCs, peering is simplest. Once you're adding a third or fourth VPC, or need transitive routing (dev → shared-services → on-prem via Direct Connect), switch to TGW — retrofitting peering into TGW later means re-doing every route table.
+
+</details>
+
+---
+
+**Q11.** How does DNS resolution work inside a VPC, and what do `enableDnsSupport` and `enableDnsHostnames` actually control?
+
+<details>
+<summary>Expected answer</summary>
+
+Every VPC has an **Amazon-provided DNS resolver** reachable at the base of the VPC CIDR + 2 (e.g. `10.0.0.2` for a `10.0.0.0/16` VPC). It resolves both public DNS names and internal VPC/Route 53 private hosted zone names.
+
+- **`enableDnsSupport`** — controls whether that resolver is even reachable from instances in the VPC. If disabled, nothing can resolve DNS at all inside the VPC.
+- **`enableDnsHostnames`** — controls whether EC2 instances (and other resources) get **DNS hostnames** assigned alongside their IPs (e.g. `ip-10-0-1-23.ec2.internal`), and whether public IPs get a resolvable public DNS name.
+
+Both must be `true` for EKS: the cluster API server endpoint, RDS endpoint hostnames, and pod-to-service DNS (via CoreDNS, which itself forwards upstream to the VPC resolver) all depend on this. If a developer reports "the RDS endpoint hostname won't resolve from my pod," and everything else looks fine, checking these two VPC attributes is a five-second check before going deeper.
+
+For cross-VPC or on-prem DNS resolution, **Route 53 Resolver** (inbound/outbound endpoints) extends this — e.g. resolving on-prem AD DNS names from within the VPC, or letting on-prem resolve private hosted zone records.
+
+</details>
+
+---
+
+**Q12.** Two teams want to peer their VPCs and discover both were created with the default `10.0.0.0/16` CIDR. Why is this a problem, and how do you prevent it going forward?
+
+<details>
+<summary>Expected answer</summary>
+
+**VPC peering (and Transit Gateway attachments) require non-overlapping CIDR ranges.** If both VPCs use `10.0.0.0/16`, AWS will simply refuse to create the peering connection — routing is ambiguous because a destination IP could exist in either VPC.
+
+This is a very common real-world mistake because `10.0.0.0/16` is the default suggested range in the AWS console and in most Terraform module examples (including a naive copy of zen-infra's `modules/vpc` for a second environment).
+
+Fix once it's already happened: there is no clean fix short of **re-IP'ing one VPC** — recreating it with a different CIDR and migrating resources, which is disruptive for anything with hardcoded IPs (RDS, on-prem firewall rules).
+
+Prevention: maintain a **CIDR allocation plan** before creating any new VPC — e.g. dev `10.0.0.0/16`, staging `10.1.0.0/16`, prod `10.2.0.0/16`, shared-services `10.3.0.0/16`. In zen-infra's `modules/vpc`, the VPC CIDR is a `var.vpc_cidr` input specifically so each environment's `terraform.tfvars` can assign a distinct block instead of everyone defaulting to the same value.
+
+</details>
+
+---
+
+**Q13.** What is the difference between an Internet Gateway (IGW) and a NAT Gateway, and why can't a private subnet just attach an IGW directly?
+
+<details>
+<summary>Expected answer</summary>
+
+**Internet Gateway (IGW)** — a horizontally scaled, VPC-wide component that does **1:1 NAT** between a resource's private IP and its assigned public/Elastic IP. It allows **both inbound and outbound** internet traffic. Anything with a public IP and a route to the IGW is directly reachable from the internet — this is what makes a subnet "public."
+
+**NAT Gateway** — sits in a public subnet, itself has an Elastic IP, and performs **source NAT (SNAT)** for outbound-only traffic from private subnets. It is stateful: it tracks connections it initiated, so unsolicited inbound traffic from the internet is dropped. This is what makes a subnet "private but internet-capable."
+
+Why a private subnet can't just route to the IGW directly: the IGW would make every instance in that subnet directly reachable inbound from the internet the moment it has a public IP — that's the definition of a public subnet, not a security boundary you can opt out of selectively. There's no "outbound only" mode on an IGW; that behavior is exactly what the NAT Gateway exists to provide.
+
+In zen-infra's `modules/vpc`: `public` subnets route `0.0.0.0/0` → IGW (bidirectional), while `private_eks` and `private_rds` subnets route `0.0.0.0/0` → NAT Gateway (outbound-only). RDS subnets don't strictly need this route at all — the deeper point is that removing the NAT route from `private_rds` entirely, since RDS never initiates outbound internet calls, is a legitimate hardening step.
+
+</details>
+
+---
+
+## 5. AWS Infrastructure Concepts (Beyond Networking)
+
+**Q14.** What is the difference between an IAM User, an IAM Role, and an IAM Policy — and why does zen-infra avoid IAM users almost entirely?
+
+<details>
+<summary>Expected answer</summary>
+
+**IAM Policy** — a JSON document that defines permissions: which actions on which resources, allow or deny. A policy by itself does nothing until it's attached to an identity.
+
+**IAM User** — a long-lived identity, typically for a human or a legacy application, with permanent credentials (password and/or access keys). Policies attach directly to a user or via a group.
+
+**IAM Role** — an identity with **no permanent credentials**. Something (a person, an EC2 instance, an EKS pod via IRSA, a GitHub Actions run via OIDC) **assumes** the role and gets temporary credentials via STS that expire (typically 1 hour, or ~15 minutes for GitHub OIDC). The same policy document shape applies to both users and roles — the difference is entirely in how credentials are obtained.
+
+zen-infra uses roles almost exclusively: the EKS node group has a role, IRSA gives pods roles, GitHub Actions assumes a role via OIDC for `terraform apply` and ECR push. The only reason to use an IAM user is a break-glass emergency account with MFA enforced, kept out of normal workflows. The interview point: **long-lived credentials are a liability** — every IAM user with an access key is a secret that can leak, needs manual rotation, and doesn't expire on its own. Roles remove that liability by design.
+
+</details>
+
+---
+
+**Q15.** What is the difference between an Application Load Balancer (ALB) and a Network Load Balancer (NLB), and which one is fronting the EKS ingress in zen-infra?
+
+<details>
+<summary>Expected answer</summary>
+
+**ALB** — operates at **Layer 7 (HTTP/HTTPS)**. It can route based on host header, path, and query string, terminate TLS, and inspect request content. Best fit for HTTP microservices where you want path-based routing (`/api/*` → one target group, `/static/*` → another) without running your own ingress logic.
+
+**NLB** — operates at **Layer 4 (TCP/UDP)**. It just forwards packets to targets with extremely low latency and can handle millions of requests per second, but has no visibility into HTTP semantics. It also supports a **static IP per AZ**, which ALB does not.
+
+In zen-infra, the **NGINX Ingress Controller** in EKS is fronted by an **NLB**, not an ALB. This is the standard pattern for Kubernetes: NGINX Ingress already does the Layer 7 routing (host/path rules, TLS termination) inside the cluster, so the load balancer in front of it only needs to forward TCP traffic to the ingress controller's pods — an NLB is cheaper and faster for that job. Using an ALB here would mean paying for Layer 7 features (the AWS Load Balancer Controller's ALB Ingress mode) that NGINX Ingress already provides, effectively duplicating the routing layer.
+
+</details>
+
+---
+
+**Q16.** What is the difference between RDS Multi-AZ and RDS Read Replicas — do they solve the same problem?
+
+<details>
+<summary>Expected answer</summary>
+
+No — they solve two different problems, and it's a common interview trap to conflate them.
+
+**Multi-AZ** — a **synchronous standby** in a different AZ, invisible as a separate endpoint. Every write to the primary is synchronously replicated to the standby before the write is acknowledged. Purpose is **availability**: if the primary fails or during patching, RDS automatically fails over to the standby (~60–120 seconds), and the DNS endpoint just starts pointing at it. You cannot query the standby directly, and it does not help with read scaling — write latency is even slightly higher due to sync replication.
+
+**Read Replica** — an **asynchronous copy**, exposed as its own separate endpoint that you can query directly. Purpose is **read scaling and workload isolation**: point reporting queries or a read-heavy service at the replica so they don't compete with the primary for resources. Because replication is async, replicas can lag behind the primary (replication lag), so they're not suitable for reads that must be immediately consistent. A read replica is not automatically promoted on primary failure — that requires a manual (or scripted) promotion.
+
+You can have both at once: a Multi-AZ primary (for HA) with one or more read replicas off of it (for read scaling). In zen-infra, the current RDS instance is Multi-AZ for HA (per the DR strategy in `04-gitops-argocd.md`) but has no read replicas — there's no read-heavy reporting workload yet to justify one.
+
+</details>
+
+---
+
+**Q17.** How do you stop an ECR repository from growing unbounded, and how do you catch vulnerable base images before they reach EKS?
+
+<details>
+<summary>Expected answer</summary>
+
+Two separate ECR features address this:
+
+**Lifecycle policies** — a JSON rule set on the repository that automatically expires old images, e.g. "keep only the last 10 tagged images" or "expire untagged images older than 14 days." Without this, every CI build pushes a new image and the repository grows forever, increasing storage cost and making it harder to find the image you actually want. Untagged images (left behind after a tag is overwritten, e.g. repeated pushes to `latest`) are the usual biggest source of waste.
+
+**Image scanning** — ECR can scan on push (`scanOnPush`) using either basic scanning (CVEs from the Clair database) or enhanced scanning (continuous rescanning via Amazon Inspector, which also catches newly disclosed CVEs in images that haven't changed). Findings appear in the ECR console/API and can gate a pipeline: fail the deploy step if any `CRITICAL` or `HIGH` severity finding is found.
+
+In zen-infra's DevSecOps pipeline (`05-security-devsecops.md`), Trivy already scans images in CI before push — ECR's own scan-on-push is a second, always-on layer that catches CVEs disclosed *after* the image was already pushed, which a one-time CI scan would miss.
+
+</details>
+
+---
+
+**Q18.** What is the difference between EBS, EFS, and S3, and where would each fit into zen-infra's stack?
+
+<details>
+<summary>Expected answer</summary>
+
+**EBS (Elastic Block Store)** — block storage attached to a **single EC2 instance** (or a single EKS node) at a time. This is what backs an EKS worker node's root volume and any `PersistentVolume` using the `ebs.csi.aws.com` driver — e.g. a StatefulSet needing its own dedicated disk. It cannot be mounted by multiple nodes simultaneously (with the newer Multi-Attach exception, which is niche and io1/io2-only).
+
+**EFS (Elastic File System)** — a managed **NFS** file system that **multiple EC2 instances or pods across AZs can mount concurrently**. Fits a workload where several pod replicas need to read/write the *same* files — e.g. a shared upload directory, or ReadWriteMany PVCs in Kubernetes. Slower per-operation latency than EBS, but that's the tradeoff for concurrent multi-writer access.
+
+**S3** — object storage, not a filesystem at all — accessed via HTTP API (`PUT`/`GET`/`DELETE` on keys), not mounted as a block or file device. Used in zen-infra for the **Terraform state backend** (with versioning and native locking) and would be the right place for things like build artifacts, ALB/NLB access logs, or backups — anything accessed by key rather than needing POSIX file semantics.
+
+The zen-pharma stack today is mostly stateless (EKS pods) plus RDS (which manages its own storage internally, invisible as EBS/EFS to the operator) — the interview point is knowing *why* you'd reach for EBS vs EFS vs S3 rather than needing to have all three wired up already.
 
 </details>
