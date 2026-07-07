@@ -8,9 +8,9 @@
 ## Table of Contents
 
 1. [Day-to-Day & Latest Work](#1-day-to-day--latest-work) — Q1–Q5
-2. [Hardest Challenges](#2-hardest-challenges) — Q6–Q9
+2. [Hardest Challenges](#2-hardest-challenges) — Q6–Q8
 3. [Behavioral & Culture Fit](#3-behavioral--culture-fit) — G1–G5
-4. [Scenario & Design Questions](#4-scenario--design-questions) — Q15–Q20
+4. [Scenario & Design Questions](#4-scenario--design-questions) — Q15–Q19
 
 ---
 
@@ -166,26 +166,6 @@ None of these three subsumes the other two — a vulnerability can exist in exac
 **Why "Dependabot already covers this layer continuously" is the key argument that makes the trade-off safe, not risky.** The team isn't removing a security control — they're recognizing that OWASP/CodeQL/Trivy on every single push and Dependabot's continuous scanning have *overlapping* coverage for the "known CVE in a dependency" case specifically. Dependabot doesn't care whether you're mid-PR or already merged — it scans your dependency manifests continuously regardless of branch activity. So delaying the *full pipeline's* CVE check to merge-time doesn't create a coverage gap for known CVEs — it just delays a second, redundant check on the same data. The residual risk being accepted is narrower than it first sounds: novel code-level vulnerabilities that only CodeQL (not Dependabot) would catch, for the duration of one PR.
 
 **The general principle worth teaching: every "shift left" security gate has a carrying cost, and the right point to gate is where marginal risk reduction stops being worth marginal friction.** This is the same logic behind branch-protection tiers, required-reviewers-by-path (as in the G4 answer's CODEOWNERS setup), and staged environments generally — security isn't binary (secure/insecure), it's a dial, and mature teams document *where* they set the dial and *why*, which is exactly why this team wrote the decision into the CI README instead of leaving it as tribal knowledge that looks like laziness to the next engineer who finds it.
-
-</details>
-
----
-
-**Q9. What's the most complex thing you've built end-to-end on this project?**
-
-- **What is being tested:** Breadth of ownership and ability to connect multiple systems.
-- **Strong answer:** The end-to-end supply chain security implementation. It spans five systems working together: (1) GitHub Actions uses OIDC — no static keys anywhere, (2) the CI pipeline builds the Docker image, runs Trivy, then calls Cosign to sign the image digest using the GitHub Actions OIDC token — keyless, no private key to manage, (3) the Cosign signature is recorded in the Rekor public transparency log with the workflow's identity and a timestamp, (4) Kyverno runs as an admission webhook in the EKS cluster and verifies every pod's image has a valid Cosign signature in Rekor before allowing it to start, (5) ArgoCD syncs the Helm values with the pinned image tag — ensuring the specific signed image is what gets deployed. The result: a rogue image pushed directly to ECR bypassing CI cannot run in the cluster — Kyverno rejects it at admission time. Building this required understanding OIDC federation, OCI image signing, transparency logs, and Kubernetes admission webhooks — it's not a single tool, it's a chain where each link depends on the next.
-
-<details>
-<summary>📘 Teaching notes (deep dive)</summary>
-
-**Why "keyless" signing solves a problem traditional code signing has always had.** Classic signing (GPG, traditional Cosign with a static keypair) requires someone to generate a private key, store it somewhere safe, and rotate it periodically — and that key becomes a single high-value secret: whoever holds it can sign *anything* and claim it's authentic, forever, until the key is revoked. Keyless Cosign (via Sigstore's Fulcio) sidesteps this entirely: instead of a long-lived private key, the CI job proves its identity using the GitHub Actions OIDC token (the same federation mechanism as IRSA, just a different relying party), and Fulcio issues a *short-lived* signing certificate bound to that specific workflow identity (repo, branch, workflow file) — valid for minutes, used once, then discarded. There is no key to leak, rotate, or steal, because there's no long-lived key at all.
-
-**What the Rekor transparency log actually buys you, and why signing alone isn't enough.** A signature only proves "someone with the right key/identity signed this" — it says nothing about *when*, or whether that signing event is the only one that ever happened. Rekor is an append-only, publicly auditable log (built on a Merkle tree, the same structure Certificate Transparency uses) that records every signing event with a timestamp and the signer's identity. This closes two gaps: (1) it prevents *quiet* re-signing — if someone re-signs a tampered image, there's a permanent public record of a second, suspicious signing event for the same artifact; (2) it lets a verifier (Kyverno, at admission time) confirm the signature isn't just cryptographically valid but was *actually logged publicly*, which is what "keyless" needs to be trustworthy without a persistent private key backing it.
-
-**How Kyverno intercepts this at the exact right moment, mechanically.** Kyverno registers as a `ValidatingAdmissionWebhook` with the Kubernetes API server. Every time *any* pod is created — regardless of how (kubectl, a Deployment controller, ArgoCD sync, a rogue `kubectl run` from someone with cluster access) — the API server calls out to Kyverno before persisting the object, and Kyverno's `ClusterPolicy` (using the `verifyImages` rule) checks the image reference against Cosign's verification logic: does a valid signature exist in Rekor, matching the expected signer identity (this specific GitHub Actions workflow)? If not, the API server rejects the pod creation outright — the pod is never even scheduled, let alone run. This is the enforcement point that makes the other four links matter: without it, you'd have a nice signing pipeline that produces cryptographic proof nobody ever checks.
-
-**Why "a rogue image pushed directly to ECR bypassing CI cannot run" is the correct threat model to name explicitly.** This closes a specific gap that image scanning (Trivy) and IAM permissions alone don't: someone with valid ECR push credentials (a compromised CI token, an over-permissioned IAM user, an insider) could push *any* image directly to the registry, skipping the build pipeline, its tests, and its scans entirely. Without Kyverno's admission-time check, EKS would happily run that image if referenced in a Deployment — it has no way to distinguish "built by our CI" from "pushed by someone with the right AWS credentials." The signature-plus-Rekor-plus-Kyverno chain is what turns "the CI pipeline is trustworthy" into "the cluster mathematically enforces that only the CI pipeline's output can run," which is a categorically stronger guarantee.
 
 </details>
 
@@ -623,28 +603,7 @@ Three independent enforcement layers — an accident requires bypassing all thre
 
 ---
 
-**Q17. How do you handle database migrations in a GitOps / Kubernetes deployment?**
-
-- **What is being tested:** Real-world deployment complexity awareness.
-- **Strong answer:** Database migrations are the hardest part of zero-downtime deployments. Options: (1) **Flyway / Liquibase as a Kubernetes Job** — an init container or a Job runs migrations before the new app pods start; ArgoCD syncs the Job first as a `PreSync` hook, then syncs the Deployment, (2) **Backward-compatible migrations** — always write migrations that the old version of the app can tolerate; add the column in one release, start using it in the next, drop the old column in a third. This allows rolling updates without downtime because old and new pods can coexist, (3) **Never run migrations as part of application startup** — if two pods start simultaneously, both try to run the migration and you get race conditions or lock timeouts.
-- **Project context:** Our Java services use Flyway (`needs-database: true` in CI runs a Postgres container to validate migrations pass before the image is built).
-
-<details>
-<summary>📘 Teaching notes (deep dive)</summary>
-
-**What Flyway actually is, for students who haven't used a migration tool before.** Flyway manages schema changes as a series of version-controlled, immutable SQL files (`V1__create_table.sql`, `V2__add_column.sql`, ...). It creates a `flyway_schema_history` table in the target database recording which versions have run, plus a checksum of each file's contents. On startup it compares the migration folder against that history table and runs only the new ones, in order, inside a transaction where the database supports it. The checksum matters pedagogically: if someone edits an already-applied migration file, Flyway detects the mismatch and refuses to proceed — migrations are meant to be append-only; you fix a mistake by writing a *new* migration, never editing an old one.
-
-**Why a `PreSync` hook is the mechanism that makes "migrate before deploy" actually enforceable in GitOps, rather than just a convention.** An ArgoCD `PreSync` hook (a Job annotated `argocd.argoproj.io/hook: PreSync`) is guaranteed to run to completion *before* ArgoCD proceeds to sync the main Deployment manifest — ArgoCD blocks on it. This turns "migrations should run before the app starts" from a hopeful ordering into an enforced one: if the Job fails, the Deployment sync never happens at all, and the previous (working) pods keep serving traffic. Compare this to migrations baked into application startup code (mentioned as an anti-pattern in this answer) — there, a failing migration crashes the very pods that were supposed to serve traffic, which is a materially worse failure mode, as explored in the Q7 teaching notes.
-
-**Why running migrations from multiple simultaneously-starting pods causes real races, mechanically.** If Flyway runs as part of app startup and you roll out 3 replicas at once, each of the 3 containers independently starts Flyway, and all 3 try to acquire the "run pending migrations" work at roughly the same instant. Flyway defends against this with a database-level advisory lock (on Postgres, `pg_advisory_lock`) — so in practice one pod wins the lock and the others block waiting for it, then see the migration already applied and skip it. This *does* prevent double-application, but it doesn't prevent the underlying design smell: your apps are now serializing on a database lock during every startup, and if the lock-holder's migration is slow or hangs, every other pod's startup silently stalls behind it with no obvious error — which is precisely why the community-recommended pattern is to run migrations exactly once, in exactly one place (a Job/hook), decoupled from however many app replicas you're scaling to.
-
-**Why backward-compatible migrations connect directly to the expand/contract pattern from Q7.** "Old version of the app can tolerate it" is the same underlying constraint as the rolling-update compatibility window discussed there: for the whole duration of a rolling deploy, both the outgoing and incoming code versions are running against the *same* database schema simultaneously. A backward-incompatible migration (dropping a column the old code still reads, for instance) breaks the old pods the instant it applies — even though the old pods' code never changed. Teaching this as one general principle rather than two separate rules helps it stick: schema and code deploy asynchronously in Kubernetes; your migrations have to assume that, not fight it.
-
-</details>
-
----
-
-**Q18. How do you mentor junior engineers on your team?**
+**Q17. How do you mentor junior engineers on your team?**
 
 - **What is being tested:** Leadership and teaching ability.
 - **Strong answer:** I pair on the first few tickets rather than just reviewing PRs after the fact. For DevOps work specifically, I set up a sandbox AWS account for junior engineers so they can run `terraform apply` without fear of breaking shared environments. I also write runbooks for common operations — deploying a new service, rotating a secret, checking ArgoCD status — so the answer to "how do I do X?" is findable without asking me. In code reviews I explain the why behind feedback ("the reason we don't store secrets in tfvars is not style — it's because git history is permanent and private repos get leaked"), not just what to change. The goal is that after 3 months they are reviewing my PRs and finding things I missed.
@@ -662,7 +621,7 @@ Three independent enforcement layers — an accident requires bypassing all thre
 
 ---
 
-**Q19. Describe how you would onboard a new engineer to this project.**
+**Q18. Describe how you would onboard a new engineer to this project.**
 
 - **What is being tested:** Documentation discipline and knowledge transfer.
 - **Strong answer:** The first day: clone the four repos and run through the README for each. The READMEs in zen-infra and zen-gitops describe the architecture end-to-end. Then read the CI pipeline for one service — `ci-auth-service.yml` — and trace exactly what happens from a push to a pod running in DEV. Day two: make a trivial change, open a PR, watch the pipeline run, see ArgoCD pick it up. Day three: read the Terraform for one module — VPC is a good start. By end of week one, the engineer should be able to explain the end-to-end flow (code → CI → ECR → GitOps PR → ArgoCD → cluster) and have merged one PR. I track onboarding progress with a checklist in the team wiki — not tribal knowledge.
@@ -680,7 +639,7 @@ Three independent enforcement layers — an accident requires bypassing all thre
 
 ---
 
-**Q20. Tell me about a disagreement you had with a teammate and how you resolved it.**
+**Q19. Tell me about a disagreement you had with a teammate and how you resolved it.**
 
 - **What is being tested:** Collaboration under conflict, not just technical skill.
 - **Strong answer:** We had a disagreement about whether to use ArgoCD auto-sync for the QA environment. A teammate argued that auto-sync was risky — any merged PR would deploy to QA immediately without a human checkpoint. I argued that the checkpoint is the PR review in zen-gitops, not a manual sync trigger — requiring manual sync in QA just adds friction without adding safety, because the same engineer who merges the PR would be the one triggering the sync anyway. We resolved it by trying auto-sync in QA for one sprint with the team's explicit agreement to revert if it caused problems. It worked well — QA deployments went from "remember to trigger the sync" to automatic, the QA team got faster feedback, and we never had an incident from an unexpected auto-sync. The teammate's concern was valid (auto-sync in PROD would be dangerous), but QA's risk profile is different.

@@ -13,10 +13,10 @@
 | [02-eks-kubernetes.md](./02-eks-kubernetes.md) | EKS & Kubernetes | 24 |
 | [03-cicd-github-actions.md](./03-cicd-github-actions.md) | CI/CD & GitHub Actions | 18 |
 | [04-gitops-argocd.md](./04-gitops-argocd.md) | GitOps & ArgoCD | 23 |
-| [05-security-devsecops.md](./05-security-devsecops.md) | Security & DevSecOps | 25 |
+| [05-security-devsecops.md](./05-security-devsecops.md) | Security & DevSecOps | 24 |
 | [06-vpc-networking-aws.md](./06-vpc-networking-aws.md) | VPC, Networking & AWS | 18 |
-| [07-behavioral-realtime.md](./07-behavioral-realtime.md) | Behavioral & Real-Time | 21 |
-| **Total** | | **174** |
+| [07-behavioral-realtime.md](./07-behavioral-realtime.md) | Behavioral & Real-Time | 19 |
+| **Total** | | **171** |
 
 ---
 
