@@ -16,7 +16,8 @@
 | [05-security-devsecops.md](./05-security-devsecops.md) | Security & DevSecOps | 24 |
 | [06-vpc-networking-aws.md](./06-vpc-networking-aws.md) | VPC, Networking & AWS | 18 |
 | [07-behavioral-realtime.md](./07-behavioral-realtime.md) | Behavioral & Real-Time | 19 |
-| **Total** | | **171** |
+| [08-observability-logging-monitoring.md](./08-observability-logging-monitoring.md) | Observability — Logging & Monitoring | 24 |
+| **Total** | | **195** |
 
 ---
 
@@ -30,6 +31,7 @@
 | CI/CD | GitHub Actions (reusable workflows), GitHub OIDC, ArgoCD |
 | Security | CodeQL, Semgrep, OWASP Dep Check, Trivy, Cosign/Sigstore |
 | GitOps | zen-gitops → Helm charts → ArgoCD → EKS namespaces (dev/qa/prod) |
+| Observability | Fluent Bit (DaemonSet) → Elasticsearch (Elastic Cloud); kube-prometheus-stack (Prometheus/Grafana/Alertmanager) |
 
 ---
 
